@@ -532,6 +532,80 @@ def generate_probabilistic_row(stats, num_needed=NUMBERS_PER_ROW):
 
     return sorted(list(selected_numbers))
 
+def generate_overdue_frequency_row(stats, num_needed=NUMBERS_PER_ROW):
+    """
+    Weighted approach focusing on how long a ball is overdue, with smaller emphasis on frequency.
+    Normalizes both metrics to avoid extreme weight disparities.
+    """
+    cold_data = stats.get('cold', [])
+    numerical_data = stats.get('numerical', [])
+
+    # Build maps
+    freq_map = {
+        item['ball']: item['drawn']
+        for item in numerical_data
+        if isinstance(item.get('ball'), int) and isinstance(item.get('drawn'), int)
+    }
+
+    def extract_days(info_str):
+        if not isinstance(info_str, str):
+            return 0
+        m = re.search(r'(\d+)\s+days? ago', info_str)
+        return int(m.group(1)) if m else 0
+
+    overdue_map = {
+        item['ball']: extract_days(item.get('last_drawn_info', ''))
+        for item in cold_data
+        if isinstance(item.get('ball'), int)
+    }
+
+    # Handle empty cases
+    all_balls = list(range(1, TOTAL_NUMBERS + 1))
+    if not overdue_map and not freq_map:
+        return sorted(random.sample(all_balls, num_needed))
+
+    # Normalize metrics
+    max_days = max(overdue_map.values(), default=0) or 1
+    max_freq = max(freq_map.values(), default=0) or 1
+
+    OVERDUE_WEIGHT = 2.0
+    FREQ_WEIGHT = 0.2
+    BASE_MIN_WEIGHT = 0.1
+
+    # Compute weights
+    weights = []
+    for b in all_balls:
+        days_norm = overdue_map.get(b, 0) / max_days
+        freq_norm = freq_map.get(b, 0) / max_freq
+        w = OVERDUE_WEIGHT * days_norm + FREQ_WEIGHT * freq_norm + BASE_MIN_WEIGHT
+        weights.append(w)
+
+    # Sample and dedupe
+    try:
+        picks = random.choices(all_balls, weights=weights, k=num_needed * 3)
+    except Exception:
+        return sorted(random.sample(all_balls, num_needed))
+
+    selected = []
+    for p in picks:
+        if p not in selected:
+            selected.append(p)
+            if len(selected) == num_needed:
+                break
+
+    # Fallback fill with top overdue if needed
+    if len(selected) < num_needed:
+        by_overdue = sorted(all_balls,
+                            key=lambda x: overdue_map.get(x, 0),
+                            reverse=True)
+        for b in by_overdue:
+            if b not in selected:
+                selected.append(b)
+            if len(selected) == num_needed:
+                break
+
+    return sorted(selected)
+
 
 # --- Output Generation ---
 
@@ -562,78 +636,128 @@ def generate_output_rows(stats, num_rows=6, numbers_per_row=NUMBERS_PER_ROW):
         return [] # Cannot proceed without Row 1
 
 
-    # --- Row 2: Top N Most Overdue (Cold), filled with next common if needed ---
-    row2_base = get_numbers_by_overdue(stats.get('cold', []), numbers_per_row)
-    row2 = list(row2_base) # Start with the overdue numbers found
-    needed_more_r2 = numbers_per_row - len(row2)
-
-    if needed_more_r2 > 0:
-        print(f"Row 2: Found only {len(row2)} unique overdue numbers. Filling {needed_more_r2} slots with next common.")
-        # Find next common numbers NOT used globally yet and NOT already in row2_base
-        fill_candidates_r2 = [num for num in most_common_all if num not in used_numbers_global and num not in row2]
-        fill_count_r2 = 0
-        for num in fill_candidates_r2:
-            if len(row2) < numbers_per_row:
-                row2.append(num)
-                fill_count_r2 += 1
-            else:
-                break
-        if fill_count_r2 < needed_more_r2:
-             print(f"Warning: Row 2 could only be filled to {len(row2)} numbers after trying next common.")
-
+    # --- Row 2: Weighted Overdue-based approach ---
+    row2 = generate_overdue_frequency_row(stats, numbers_per_row)
     if len(row2) == numbers_per_row:
-        rows.append(sorted(row2))
-        used_numbers_global.update(row2) # Add row 2 numbers to global used set
-        print("Generated Row 2 (Most Overdue / Filled)")
+        rows.append(row2)
+        used_numbers_global.update(row2)
+        print("Generated Row 2 (Weighted Overdue)")
     else:
-        print(f"Warning: Could not generate Row 2 (Most Overdue / Filled) with exactly {numbers_per_row} unique numbers (got {len(row2)}). Skipping row.")
-        # Decide if we should abort or continue? For now, continue.
+        print(f"Warning: Could not generate Row 2 (Weighted Overdue) with exactly {numbers_per_row} unique numbers (got {len(row2)}). Skipping row.")
 
-
-    # --- Row 3: Next N Most Common ---
-    # Find candidates NOT used globally yet
+    # --- Row 3: Next N Most Common with probabilistic weighting ---
     row3_candidates = [num for num in most_common_all if num not in used_numbers_global]
-    row3 = row3_candidates[:numbers_per_row] # Take the first N available unique common numbers
-
-    # If not enough unique candidates, fill randomly (controversial, maybe skip?)
-    needed_more_r3 = numbers_per_row - len(row3)
-    if needed_more_r3 > 0:
-         print(f"Row 3: Found only {len(row3)} unique 'next common' numbers. Filling {needed_more_r3} slots randomly.")
-         all_possible_numbers = set(range(1, TOTAL_NUMBERS + 1))
-         available_fill_r3 = list(all_possible_numbers - used_numbers_global - set(row3))
-         try:
-             random_fill_r3 = random.sample(available_fill_r3, needed_more_r3)
-             row3.extend(random_fill_r3)
-         except ValueError:
-              print(f"Warning: Row 3 could only be filled to {len(row3)} numbers after trying random fill.")
-
-
-    if len(row3) == numbers_per_row:
-        rows.append(sorted(row3))
-        used_numbers_global.update(row3) # Add row 3 numbers to global used set
-        print("Generated Row 3 (Next Most Common / Filled)")
+    if not row3_candidates:
+        print("Warning: No candidates available for Row 3. Skipping row.")
     else:
-        print(f"Warning: Could not generate Row 3 (Next Most Common) with exactly {numbers_per_row} unique numbers (got {len(row3)}). Skipping row.")
+        # build a frequency map for weighting
+        freq_map = {item['ball']: item['drawn'] for item in stats.get('numerical', [])}
+        # prepare parallel weight list (use count=1 if missing)
+        weights = [freq_map.get(num, 1) for num in row3_candidates]
+        selected = []
+        # weighted sampling without replacement
+        try:
+            import random
+            temp_cands = list(row3_candidates)
+            temp_weights = list(weights)
+            while len(selected) < numbers_per_row and temp_cands:
+                pick = random.choices(temp_cands, weights=temp_weights, k=1)[0]
+                selected.append(pick)
+                idx = temp_cands.index(pick)
+                temp_cands.pop(idx)
+                temp_weights.pop(idx)
+        except Exception as e:
+            print(f"Warning: Weighted sampling failed ({e}), falling back to simple slice.")
+            selected = row3_candidates[:numbers_per_row]
 
+        # fill any remaining slots uniformly at random
+        if len(selected) < numbers_per_row:
+            remaining = [n for n in range(1, TOTAL_NUMBERS+1) if n not in used_numbers_global and n not in selected]
+            try:
+                fill = random.sample(remaining, numbers_per_row - len(selected))
+                selected.extend(fill)
+            except Exception:
+                pass
 
-    # --- Row 4: Mix Hot/Cold (e.g., 4 Hot + 3 Cold) ---
-    count1_r4 = 4
-    count2_r4 = 3
-    # Use the full lists, let select_unique_combination handle uniqueness
-    hot_candidates_r4 = most_common_all
-    cold_candidates_r4 = most_overdue_all
-    if len(hot_candidates_r4) >= count1_r4 and len(cold_candidates_r4) >= count2_r4:
-        row4 = select_unique_combination(hot_candidates_r4, count1_r4, cold_candidates_r4, count2_r4, numbers_per_row)
-        if len(row4) == numbers_per_row:
-            rows.append(sorted(row4))
-            print("Generated Row 4 (Mix Hot/Cold)")
+        if len(selected) == numbers_per_row:
+            row3 = sorted(selected)
+            rows.append(row3)
+            used_numbers_global.update(row3)
+            print("Generated Row 3 (Probabilistic Next Most Common)")
         else:
-            print(f"Warning: Could not generate Row 4 (Mix Hot/Cold) with exactly {numbers_per_row} unique numbers (got {len(row4)}). Skipping row.")
+            print(f"Warning: Could not generate Row 3 with {numbers_per_row} nums (got {len(selected)}). Skipping row.")
+
+    # --- Row 4: Mix Hot/Cold (Probabilistic 3 Hot + 3 Cold + 1 Fill based on ≈1/57 probability) ---
+    count1_r4 = 3  # Target 3 hot
+    count2_r4 = 3  # Target 3 cold
+    pool_size_r4 = 15 # Define the size of the candidate pools for sampling
+
+    # Get candidate pools (more than needed for sampling)
+    hot_pool_r4 = most_common_all[:pool_size_r4]
+    cold_pool_r4 = most_overdue_all[:pool_size_r4]
+
+    if len(hot_pool_r4) < count1_r4 or len(cold_pool_r4) < count2_r4:
+        print(f"Warning: Insufficient candidates for Row 4 pools (need {count1_r4} from {len(hot_pool_r4)} hot, {count2_r4} from {len(cold_pool_r4)} cold). Skipping.")
     else:
-        print(f"Warning: Insufficient base numbers for Row 4 (Mix Hot/Cold). Need {count1_r4} hot ({len(hot_candidates_r4)} avail), {count2_r4} cold ({len(cold_candidates_r4)} avail). Skipping row.")
+        selected_r4 = set()
+        import random # Ensure random is imported
+
+        # Sample 3 from hot pool
+        try:
+            hot_picks = random.sample(hot_pool_r4, count1_r4)
+            selected_r4.update(hot_picks)
+        except ValueError:
+            print(f"Warning: Could not sample {count1_r4} unique numbers from hot pool of size {len(hot_pool_r4)} for Row 4.")
+            # Attempt to take as many as possible if sampling failed (e.g., pool too small unexpectedly)
+            selected_r4.update(hot_pool_r4)
+
+
+        # Sample 3 from cold pool, ensuring uniqueness from hot picks if possible
+        # Create a list of cold candidates not already picked from the hot pool
+        cold_candidates_for_sampling = [num for num in cold_pool_r4 if num not in selected_r4]
+        needed_from_cold = count2_r4 # We aim for 3 cold numbers
+
+        # How many can we actually pick from the unique cold candidates?
+        can_pick_from_cold = min(needed_from_cold, len(cold_candidates_for_sampling))
+
+        if can_pick_from_cold > 0:
+            try:
+                cold_picks = random.sample(cold_candidates_for_sampling, can_pick_from_cold)
+                selected_r4.update(cold_picks)
+            except ValueError:
+                 # This shouldn't happen if can_pick_from_cold is calculated correctly, but handle defensively
+                 print(f"Warning: Error sampling {can_pick_from_cold} from cold candidates for Row 4.")
+        # else: No unique cold candidates available to pick from
+
+        # Fill remaining slots randomly if needed (up to numbers_per_row)
+        needed_fill = numbers_per_row - len(selected_r4)
+        if needed_fill > 0:
+            # print(f"Row 4: Need to fill {needed_fill} more numbers randomly.") # Optional debug print
+            all_numbers = set(range(1, TOTAL_NUMBERS + 1))
+            # Pool of numbers not yet selected
+            remaining_pool = list(all_numbers - selected_r4)
+            # How many can we actually fill?
+            can_fill = min(needed_fill, len(remaining_pool))
+
+            if can_fill > 0:
+                try:
+                    fill_picks = random.sample(remaining_pool, can_fill)
+                    selected_r4.update(fill_picks)
+                except ValueError:
+                     print(f"Warning: Could not sample {can_fill} fill numbers for Row 4 from remaining pool of size {len(remaining_pool)}.")
+                     # Row might be incomplete
+            # else: No remaining numbers in the entire pool to pick from
+
+        # Final check and append
+        if len(selected_r4) == numbers_per_row:
+            rows.append(sorted(list(selected_r4)))
+            print("Generated Row 4 (Probabilistic Mix 3 Hot/3 Cold + Fill)")
+        else:
+            print(f"Warning: Could not generate Row 4 with exactly {numbers_per_row} unique numbers (got {len(selected_r4)}). Skipping row.")
+
 
     # --- Row 5: Mix Next Hot/Cold (e.g., Hot ranks 5-8 + Cold ranks 4-6) ---
-    start_hot_r5 = count1_r4 # Start after the ones potentially used in Row 4
+    start_hot_r5 = count1_r4 # Start after the ones potentially used in Row 4 (this might need adjustment if pool_size_r4 is large)
     count_hot_r5 = 4
     start_cold_r5 = count2_r4 # Start after the ones potentially used in Row 4
     count_cold_r5 = 3
@@ -649,24 +773,50 @@ def generate_output_rows(stats, num_rows=6, numbers_per_row=NUMBERS_PER_ROW):
     else:
          print(f"Warning: Insufficient candidate numbers for Row 5 (Mix Next Hot/Cold). Need {count_hot_r5} more hot ({len(hot_r5_candidates)} avail), {count_cold_r5} more cold ({len(cold_r5_candidates)} avail). Skipping row.")
 
-    # --- Row 6: Mix Least Common/Hot (e.g., 4 Least Common + 3 Hot) ---
-    count1_r6 = 4
-    count2_r6 = 3
-    least_common_candidates_r6 = least_common_all
-    hot_candidates_r6 = most_common_all
-    if not least_common_candidates_r6 or len(least_common_candidates_r6) < count1_r6:
-         print(f"Warning: Insufficient least common numbers ({len(least_common_candidates_r6)}) for Row 6. Need {count1_r6}. Skipping row.")
-    elif len(hot_candidates_r6) < count2_r6:
-         print(f"Warning: Insufficient most common numbers ({len(hot_candidates_r6)}) for Row 6. Need {count2_r6}. Skipping row.")
-    else:
-        row6 = select_unique_combination(least_common_candidates_r6, count1_r6, hot_candidates_r6, count2_r6, numbers_per_row)
-        if len(row6) == numbers_per_row:
-            rows.append(sorted(row6))
-            print("Generated Row 6 (Mix Least Common/Hot)")
-        else:
-            print(f"Warning: Could not generate Row 6 (Mix Least Common/Hot) with exactly {numbers_per_row} unique numbers (got {len(row6)}). Skipping row.")
+    # --- Row 6: Random Sample from "Middle Ground" Numbers ---
+    N_extremes = 15 # How many numbers to exclude from each end (hot, cold, least)
+    exclusion_set = set(most_common_all[:N_extremes]) | \
+                    set(least_common_all[:N_extremes]) | \
+                    set(most_overdue_all[:N_extremes])
 
-    # Return only the successfully generated rows
+    all_possible_numbers = set(range(1, TOTAL_NUMBERS + 1))
+    middle_pool = list(all_possible_numbers - exclusion_set)
+
+    print(f"Row 6: Middle pool size (excluding top/bottom {N_extremes} hot/least/cold): {len(middle_pool)}")
+
+    if len(middle_pool) >= numbers_per_row:
+        try:
+            row6 = random.sample(middle_pool, numbers_per_row)
+            rows.append(sorted(row6))
+            print("Generated Row 6 (Random Sample from Middle Ground)")
+        except ValueError:
+             print(f"Warning: Could not sample {numbers_per_row} from middle pool of size {len(middle_pool)}. Falling back.")
+             # Fallback: Pure random sample
+             row6 = random.sample(list(all_possible_numbers), numbers_per_row)
+             rows.append(sorted(row6))
+             print("Generated Row 6 (Pure Random Fallback)")
+
+    else:
+        print(f"Warning: Middle pool too small ({len(middle_pool)}). Falling back to pure random sample for Row 6.")
+        # Fallback: Pure random sample
+        try:
+            row6 = random.sample(list(all_possible_numbers), numbers_per_row)
+            rows.append(sorted(row6))
+            print("Generated Row 6 (Pure Random Fallback)")
+        except ValueError:
+             print(f"Error: Cannot generate Row 6 even with fallback (not enough numbers overall?). Skipping.")
+
+
+    # Deduplicate identical rows: replace any exact duplicates with the string "duplicate"
+    seen = set()
+    for idx, r in enumerate(rows):
+        if isinstance(r, list):
+            key = tuple(r)
+            if key in seen:
+                rows[idx] = "duplicate"
+            else:
+                seen.add(key)
+
     print(f"Successfully generated {len(rows)} rows in total.")
     return rows # Return whatever was successfully generated
 
