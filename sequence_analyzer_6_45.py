@@ -10,14 +10,14 @@ import random # For potential tie-breaking or random selection within criteria
 import re # Add import for regular expressions
 
 # --- Configuration ---
-STATS_URL = "https://australia.national-lottery.com/oz-lotto/statistics"
+STATS_URL = "https://australia.national-lottery.com/saturday-lotto/statistics"
 HTML_HISTORY_DIR = "html_history"
-FILENAME_PREFIX = "oz_lotto_stats_"
+FILENAME_PREFIX = "saturday_lotto_stats_"
 FILENAME_DATE_FORMAT = "%Y-%m-%d"
 DAYS_BETWEEN_DOWNLOADS = 7
-OUTPUT_FILENAME = "output.txt"
-NUMBERS_PER_ROW = 7 # Oz Lotto draws 7 main numbers
-TOTAL_NUMBERS = 47 # Oz Lotto pool size
+OUTPUT_FILENAME = "saturday_lotto_output.txt"
+NUMBERS_PER_ROW = 6 # Lotto draws 7 main numbers
+TOTAL_NUMBERS = 45 # Lotto pool size
 
 # --- Number Generation Weights ---
 # Adjust these to change the bias in probabilistic selection
@@ -756,22 +756,116 @@ def generate_output_rows(stats, num_rows=6, numbers_per_row=NUMBERS_PER_ROW):
             print(f"Warning: Could not generate Row 4 with exactly {numbers_per_row} unique numbers (got {len(selected_r4)}). Skipping row.")
 
 
-    # --- Row 5: Mix Next Hot/Cold (e.g., Hot ranks 5-8 + Cold ranks 4-6) ---
-    start_hot_r5 = count1_r4 # Start after the ones potentially used in Row 4 (this might need adjustment if pool_size_r4 is large)
+    # --- Row 5: Probabilistic Mix of Next Hot/Cold (Weighted, Non-Repetitive) ---
+    print("Generating Row 5 (Probabilistic Next Hot/Cold Weighted)...")
     count_hot_r5 = 4
-    start_cold_r5 = count2_r4 # Start after the ones potentially used in Row 4
     count_cold_r5 = 3
-    hot_r5_candidates = most_common_all[start_hot_r5:]
-    cold_r5_candidates = most_overdue_all[start_cold_r5:]
-    if len(hot_r5_candidates) >= count_hot_r5 and len(cold_r5_candidates) >= count_cold_r5:
-        row5 = select_unique_combination(hot_r5_candidates, count_hot_r5, cold_r5_candidates, count_cold_r5, numbers_per_row)
-        if len(row5) == numbers_per_row:
-            rows.append(sorted(row5))
-            print("Generated Row 5 (Mix Next Hot/Cold)")
-        else:
-            print(f"Warning: Could not generate Row 5 (Mix Next Hot/Cold) with exactly {numbers_per_row} unique numbers (got {len(row5)}). Skipping row.")
+    pool_start_rank = 4  # Start after the top 3 used in Row 4's *target* counts
+    pool_end_rank = 20   # Use up to rank 20 for variety
+
+    # Exclude numbers actually selected in Row 4 if it was generated
+    used_in_row4 = set(selected_r4) if 'selected_r4' in locals() and isinstance(selected_r4, set) else set()
+
+    # Build candidate pools (ranks 5-20, excluding Row 4 picks)
+    hot_pool_r5 = [n for n in most_common_all[pool_start_rank:pool_end_rank] if n not in used_in_row4]
+    cold_pool_r5 = [n for n in most_overdue_all[pool_start_rank:pool_end_rank] if n not in used_in_row4]
+
+    # Build weights (frequency for hot, overdue for cold)
+    freq_map = {item['ball']: item['drawn'] for item in stats.get('numerical', []) if isinstance(item.get('ball'), int) and isinstance(item.get('drawn'), int)}
+
+    def extract_days(info_str):
+        if not isinstance(info_str, str): return 0
+        m = re.search(r'(\d+)\s+days? ago', info_str)
+        return int(m.group(1)) if m else 0
+
+    overdue_map = {}
+    for item in stats.get('cold', []):
+        if isinstance(item.get('ball'), int):
+            days_ago = extract_days(item.get('last_drawn_info', ''))
+            overdue_map[item['ball']] = days_ago
+
+    hot_weights = [freq_map.get(n, 1) for n in hot_pool_r5] # Use 1 if freq missing
+    cold_weights = [overdue_map.get(n, 1) for n in cold_pool_r5] # Use 1 if overdue missing
+
+    import random
+
+    # Weighted random sampling without replacement helper function
+    def weighted_sample_without_replacement(pool, weights, k):
+        if not pool or not weights or len(pool) != len(weights) or k <= 0:
+            return []
+        if k > len(pool): k = len(pool) # Cannot pick more than available
+
+        chosen_indices = set()
+        chosen_items = []
+        
+        # Make copies to modify
+        current_pool = list(pool)
+        current_weights = list(weights)
+
+        for _ in range(k):
+            if not current_pool: break # Stop if pool is exhausted
+
+            # Use random.choices for weighted selection
+            try:
+                 # Need to handle potential zero total weight if all weights become 0 after pops
+                 if sum(current_weights) <= 0:
+                      # Fallback to uniform random sample if weights are invalid
+                      idx_to_pick = random.choice(range(len(current_pool)))
+                 else:
+                      chosen_index_in_current = random.choices(range(len(current_pool)), weights=current_weights, k=1)[0]
+                 
+                 picked_item = current_pool.pop(chosen_index_in_current)
+                 current_weights.pop(chosen_index_in_current) # Remove corresponding weight
+                 chosen_items.append(picked_item)
+
+            except ValueError as e:
+                 print(f"Warning: Error in weighted sampling ({e}). Pool size: {len(current_pool)}, Weights: {len(current_weights)}. Picking uniformly.")
+                 # Fallback to uniform random sampling if weights cause issues
+                 if current_pool:
+                      idx_to_pick = random.randrange(len(current_pool))
+                      picked_item = current_pool.pop(idx_to_pick)
+                      current_weights.pop(idx_to_pick) # Still remove weight
+                      chosen_items.append(picked_item)
+                 else:
+                      break # Pool empty
+
+        return chosen_items
+
+    # Perform weighted sampling
+    hot_picks_r5 = weighted_sample_without_replacement(hot_pool_r5, hot_weights, count_hot_r5)
+
+    # Ensure cold pool for sampling doesn't include hot picks
+    cold_pool_r5_filtered = [n for n in cold_pool_r5 if n not in hot_picks_r5]
+    cold_weights_filtered = [overdue_map.get(n, 1) for n in cold_pool_r5_filtered]
+
+    cold_picks_r5 = weighted_sample_without_replacement(cold_pool_r5_filtered, cold_weights_filtered, count_cold_r5)
+
+    selected_r5 = set(hot_picks_r5 + cold_picks_r5)
+
+    # Fill if needed
+    needed_fill_r5 = numbers_per_row - len(selected_r5)
+    if needed_fill_r5 > 0:
+        print(f"Row 5: Need to fill {needed_fill_r5} more numbers randomly.")
+        all_numbers = set(range(1, TOTAL_NUMBERS + 1))
+        # Pool of numbers not yet selected in this row
+        fill_pool = list(all_numbers - selected_r5)
+        can_fill_r5 = min(needed_fill_r5, len(fill_pool))
+
+        if can_fill_r5 > 0:
+            try:
+                fill_picks_r5 = random.sample(fill_pool, can_fill_r5)
+                selected_r5.update(fill_picks_r5)
+            except ValueError:
+                 print(f"Warning: Could not sample {can_fill_r5} fill numbers for Row 5 from remaining pool of size {len(fill_pool)}.")
+                 # Row might be incomplete
+
+    # Final check and append (No shuffle needed as we sort)
+    if len(selected_r5) == numbers_per_row:
+        rows.append(sorted(list(selected_r5)))
+        print("Generated Row 5 (Probabilistic Next Hot/Cold Weighted)")
     else:
-         print(f"Warning: Insufficient candidate numbers for Row 5 (Mix Next Hot/Cold). Need {count_hot_r5} more hot ({len(hot_r5_candidates)} avail), {count_cold_r5} more cold ({len(cold_r5_candidates)} avail). Skipping row.")
+        print(f"Warning: Could not generate Row 5 with exactly {numbers_per_row} unique numbers (got {len(selected_r5)}). Skipping row.")
+
 
     # --- Row 6: Random Sample from "Middle Ground" Numbers ---
     N_extremes = 15 # How many numbers to exclude from each end (hot, cold, least)

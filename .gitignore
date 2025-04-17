@@ -1,6 +1,8 @@
 /.venv
 /html_history
 /output.txt
+/saturday_lotto_output.txt
+/oz_lotto_output.txt
 
 # Environment files
 .Environment
