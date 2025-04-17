@@ -17,6 +17,14 @@ FILENAME_DATE_FORMAT = "%Y-%m-%d"
 DAYS_BETWEEN_DOWNLOADS = 7
 OUTPUT_FILENAME = "output.txt"
 NUMBERS_PER_ROW = 7 # Oz Lotto draws 7 main numbers
+TOTAL_NUMBERS = 47 # Oz Lotto pool size
+
+# --- Number Generation Weights ---
+# Adjust these to change the bias in probabilistic selection
+BASE_WEIGHT = 1.0
+FREQUENCY_MULTIPLIER = 0.5 # How much frequency affects weight (relative to base)
+OVERDUE_BONUS = 10.0      # Flat bonus weight for top N overdue numbers
+NUM_OVERDUE_CONSIDERED = 10 # How many top overdue numbers get the bonus
 
 # --- Helper Functions ---
 
@@ -75,11 +83,17 @@ def download_stats_if_needed(url, history_dir, prefix, date_format, days_interva
         print("No previous download found.")
         should_download = True
     else:
-        print(f"Latest download found: {os.path.basename(latest_file)} from {latest_date.date()}")
-        if (today - latest_date.date()) >= timedelta(days=days_interval):
+        # Use os.path.basename only if latest_file is not None
+        if latest_file:
+             print(f"Latest download found: {os.path.basename(latest_file)} from {latest_date.date()}")
+        else:
+             print(f"Latest download date found ({latest_date.date()}), but file path is missing. Will attempt download.")
+             should_download = True # Treat missing file path as needing download
+
+        if not should_download and (today - latest_date.date()) >= timedelta(days=days_interval):
             print(f"Latest download is {days_interval} or more days old.")
             should_download = True
-        else:
+        elif not should_download:
             print("Latest download is recent enough.")
 
     if should_download:
@@ -126,20 +140,20 @@ def parse_table_data(table_element, expected_cols):
             ball_int = int(balls[0]) if len(balls) == 1 else None
             balls_int = [int(b) for b in balls] if balls else []
         except (ValueError, TypeError):
-            print(f"Warning: Could not convert ball number to int in row: {row_data}")
+            # print(f"Warning: Could not convert ball number to int in row: {row_data}") # Reduce noise
             ball_int = balls[0] if len(balls) == 1 else None # Keep as string if conversion fails
             balls_int = balls # Keep as strings
 
         item = {'raw_data': row_data} # Default structure
 
         # Structure known formats with integer conversion attempts
-        if expected_cols == 3 and len(balls_int) == 1: # Hot, Least Often
+        if expected_cols == 3 and len(balls_int) == 1 and ball_int is not None: # Hot, Least Often
              try:
                  drawn_count = int(row_data[1].replace(',', '')) # Remove commas if present
                  item = {'ball': ball_int, 'drawn': drawn_count, 'last_drawn_info': row_data[2]}
              except (ValueError, TypeError, IndexError):
                  item = {'ball': ball_int, 'drawn': row_data[1], 'last_drawn_info': row_data[2]} # Fallback
-        elif expected_cols == 2 and len(balls_int) == 1: # Cold
+        elif expected_cols == 2 and len(balls_int) == 1 and ball_int is not None: # Cold
              item = {'ball': ball_int, 'last_drawn_info': row_data[1]}
         elif expected_cols == 3 and len(balls_int) == 2: # Pairs
              try:
@@ -154,9 +168,19 @@ def parse_table_data(table_element, expected_cols):
              except (ValueError, TypeError, IndexError):
                  item = {'balls': balls_int, 'drawn': row_data[3]} # Fallback
         else: # Fallback for unexpected structures
-             item = {'balls': balls_int, 'raw_data': row_data}
+             # Ensure balls_int contains integers if possible, else strings
+             processed_balls = []
+             for b in balls_int:
+                 try:
+                     processed_balls.append(int(b))
+                 except (ValueError, TypeError):
+                     processed_balls.append(b) # Keep original if not convertible
+             item = {'balls': processed_balls, 'raw_data': row_data}
 
-        data.append(item)
+
+        # Only add if we successfully structured it or it's a fallback with balls
+        if 'ball' in item or 'balls' in item:
+             data.append(item)
 
     return data
 
@@ -169,9 +193,12 @@ def parse_numerical_order(soup):
         return data
     cells = numeric_order_div.find_all('div', class_='tableCell')
     for cell in cells:
-        ball_text = cell.find('div', class_='ball').get_text(strip=True)
+        ball_element = cell.find('div', class_='ball')
+        if not ball_element: continue # Skip if no ball element
+        ball_text = ball_element.get_text(strip=True)
+
         drawn_text_element = cell.find(string=lambda t: 'Drawn:' in t if t else False)
-        drawn_times_text = 'N/A'
+        drawn_times_text = '0' # Default to 0 if not found
         if drawn_text_element:
              strong_tag = drawn_text_element.find_next('strong')
              if strong_tag:
@@ -184,7 +211,12 @@ def parse_numerical_order(soup):
             data.append({'ball': ball_int, 'drawn': drawn_int})
         except (ValueError, TypeError):
             print(f"Warning: Could not convert numerical order data to int: ball='{ball_text}', drawn='{drawn_times_text}'")
-            data.append({'ball': ball_text, 'drawn': drawn_times_text}) # Fallback to strings
+            # Fallback to strings or skip? Let's try to keep the ball number if possible
+            try:
+                 ball_int = int(ball_text)
+                 data.append({'ball': ball_int, 'drawn': 0}) # Assign 0 frequency if count fails
+            except (ValueError, TypeError):
+                 continue # Skip if ball number itself is invalid
 
     return data
 
@@ -192,45 +224,79 @@ def find_table_after_heading(soup, heading_text, heading_tag='h2', table_class='
     """Finds the first table immediately following a specific heading."""
     heading = soup.find(heading_tag, string=lambda t: t and heading_text in t)
     if not heading:
-        print(f"Warning: Heading '{heading_text}' not found.")
+        # Try finding heading within common parent structures if direct find fails
+        possible_parents = soup.find_all(['div', 'section']) # Common containers
+        for parent in possible_parents:
+             heading = parent.find(heading_tag, string=lambda t: t and heading_text in t)
+             if heading: break # Found it
+
+    if not heading:
+        # print(f"Warning: Heading '{heading_text}' not found.") # Reduce noise
         return None
+
     # Find the next sibling table
     table = heading.find_next_sibling('table', class_=table_class)
-    # Sometimes the table might be wrapped in a div
-    if not table:
-         parent_div = heading.find_parent('div', class_='box') # Common parent
-         if parent_div:
-              table = parent_div.find('table', class_=table_class) # Find first table within the box after heading? Risky.
-              # Let's try finding the table directly after the heading's container if no direct sibling
-              container = heading.parent
-              table = container.find_next_sibling('table', class_=table_class)
-              if not table: # Check within common parent structures
-                   if container.name == 'div' and 'twoCol' in container.get('class', []):
-                        table = container.find('table', class_=table_class)
 
+    # If no direct sibling, search within parent containers more robustly
+    if not table:
+        current = heading
+        while current.parent:
+            # Check siblings of the current element's container
+            container = current.parent
+            table = container.find_next_sibling('table', class_=table_class)
+            if table: break
+
+            # Check within the container itself (sometimes heading and table are siblings inside a div)
+            table = heading.find_next('table', class_=table_class)
+            if table: break
+
+            # Check within common parent structures like 'box' or 'twoCol' relative to heading's parent
+            parent_div = heading.find_parent('div', class_='box')
+            if parent_div:
+                table = parent_div.find('table', class_=table_class)
+                if table: break
+
+            parent_twoCol = heading.find_parent('div', class_='twoCol')
+            if parent_twoCol:
+                 table = parent_twoCol.find('table', class_=table_class)
+                 if table: break
+
+            current = container # Move up the tree
 
     if not table:
-         print(f"Warning: Table after heading '{heading_text}' not found.")
+         # print(f"Warning: Table after heading '{heading_text}' not found.") # Reduce noise
+         pass
 
     return table
 
 def find_table_in_div_after_heading(soup, heading_text, heading_tag='div', div_class='twoCol', table_class='table'):
      """Finds a table within a specific div structure following a heading-like element."""
-     heading = soup.find(heading_tag, class_='h3', string=lambda t: t and heading_text in t)
-     if not heading:
-          print(f"Warning: Heading '{heading_text}' not found in specified structure.")
+     # Find the heading first (might be h3 or similar inside the target div)
+     target_div = None
+     possible_headings = soup.find_all(['h2', 'h3', 'div'], string=lambda t: t and heading_text in t)
+
+     for h in possible_headings:
+         # Check if this heading is inside the desired div structure
+         parent_div = h.find_parent('div', class_=div_class)
+         if parent_div:
+             # Check if the heading is specifically the one we look for (e.g., class h3)
+             if h.name == heading_tag or (heading_tag == 'div' and 'h3' in h.get('class', [])):
+                  target_div = parent_div
+                  break # Found the right structure
+
+     if not target_div:
+          # print(f"Warning: Could not find parent div '{div_class}' containing heading '{heading_text}'.") # Reduce noise
           return None
-     parent_div = heading.find_parent('div', class_=div_class)
-     if not parent_div:
-          print(f"Warning: Could not find parent div '{div_class}' for heading '{heading_text}'.")
-          return None
-     table = parent_div.find('table', class_=table_class)
+
+     table = target_div.find('table', class_=table_class)
      if not table:
-          print(f"Warning: Table not found within div for heading '{heading_text}'.")
+          # print(f"Warning: Table not found within div for heading '{heading_text}'.") # Reduce noise
+          pass
      return table
 
 
 # --- Original Analysis Function (Optional) ---
+
 def analyze_recurring_order(data, subsequence_length=2):
     """
     Analyzes the frequency of recurring consecutive subsequences in a list of number sequences.
@@ -314,7 +380,7 @@ def get_numbers_by_overdue(cold_data, count):
 
     # Sort by days_ago (descending - most days ago first), then ball number for stability
     sorted_data = sorted(valid_data, key=lambda x: (x['days_ago'], x['ball']), reverse=True)
-    
+
     # Return only the unique ball numbers up to the requested count
     unique_balls = []
     seen_balls = set()
@@ -324,8 +390,9 @@ def get_numbers_by_overdue(cold_data, count):
             seen_balls.add(item['ball'])
             if len(unique_balls) == count:
                 break
-                
+
     return unique_balls
+
 
 def get_numbers_by_least_frequent(least_frequent_data, count):
     """Gets top 'count' least frequent numbers."""
@@ -363,11 +430,11 @@ def select_unique_combination(list1, count1, list2, count2, total_needed):
          num = pool2[idx2]
          if num not in selected:
               selected.append(num)
-         # Always increment idx2 to move through pool2, even if num was duplicate
-         idx2 +=1 
-         # Only count additions towards the count2 limit if unique
-         if num not in selected[:-1]: # Check if it was actually added
+              # Only count additions towards the count2 limit if unique
               added_count +=1
+         # Always increment idx2 to move through pool2, even if num was duplicate
+         idx2 +=1
+
 
     # If still not enough, fill remaining from pool1 (beyond the initial count1)
     while len(selected) < total_needed and idx1 < len(pool1):
@@ -386,6 +453,84 @@ def select_unique_combination(list1, count1, list2, count2, total_needed):
     # Final check - return exactly total_needed unique numbers if possible
     # If we couldn't reach total_needed, return what we have
     return list(set(selected))[:total_needed]
+
+def generate_probabilistic_row(stats, num_needed=NUMBERS_PER_ROW):
+    """Generates a row of numbers using weighted random selection based on stats."""
+    print("Generating Row 1 (Probabilistic Weighted)...")
+    numerical_data = stats.get('numerical', [])
+    cold_data = stats.get('cold', [])
+
+    if not numerical_data:
+        print("Error: Cannot generate probabilistic row without numerical frequency data. Falling back to random.")
+        return sorted(random.sample(range(1, TOTAL_NUMBERS + 1), num_needed))
+
+    # 1. Create frequency map
+    freq_map = {item['ball']: item['drawn'] for item in numerical_data if isinstance(item.get('ball'), int) and isinstance(item.get('drawn'), int)}
+
+    # 2. Identify top overdue balls
+    top_overdue = get_numbers_by_overdue(cold_data, NUM_OVERDUE_CONSIDERED)
+
+    # 3. Calculate weights
+    weights = {}
+    all_balls = list(range(1, TOTAL_NUMBERS + 1))
+    total_weight = 0
+    for ball in all_balls:
+        weight = BASE_WEIGHT
+        # Add frequency bonus
+        frequency = freq_map.get(ball, 0)
+        weight += frequency * FREQUENCY_MULTIPLIER
+        # Add overdue bonus
+        if ball in top_overdue:
+            weight += OVERDUE_BONUS
+        
+        # Ensure weight is not negative (shouldn't happen with current logic)
+        weights[ball] = max(0.1, weight) # Use a small minimum weight
+        total_weight += weights[ball]
+        
+    # Handle case where total_weight is zero (e.g., all data invalid)
+    if total_weight <= 0:
+        print("Error: Total weight is zero. Falling back to random selection.")
+        return sorted(random.sample(all_balls, num_needed))
+
+    # 4. Normalize weights (optional but good practice for understanding probabilities)
+    # probabilities = {ball: w / total_weight for ball, w in weights.items()}
+
+    # 5. Select numbers
+    selected_numbers = set()
+    population = list(weights.keys())
+    weight_values = list(weights.values())
+
+    # Pick slightly more than needed to increase chance of getting unique numbers quickly
+    sample_size = num_needed * 3
+    try:
+        weighted_sample = random.choices(population, weights=weight_values, k=sample_size)
+    except ValueError as e:
+         print(f"Error during random.choices (weights might be invalid): {e}. Falling back to random.")
+         return sorted(random.sample(all_balls, num_needed))
+
+
+    # Extract unique numbers from the weighted sample
+    for num in weighted_sample:
+        if len(selected_numbers) < num_needed:
+            selected_numbers.add(num)
+        else:
+            break
+
+    # 6. Fill if necessary (unlikely with k=num_needed*3 but possible)
+    needed_more = num_needed - len(selected_numbers)
+    if needed_more > 0:
+        print(f"Probabilistic selection yielded {len(selected_numbers)} unique numbers. Filling {needed_more} randomly.")
+        remaining_population = [ball for ball in all_balls if ball not in selected_numbers]
+        try:
+            random_fill = random.sample(remaining_population, needed_more)
+            selected_numbers.update(random_fill)
+        except ValueError:
+             print(f"Error: Not enough remaining numbers ({len(remaining_population)}) to fill the row.")
+             # Return what we have, even if incomplete
+             return sorted(list(selected_numbers))
+
+
+    return sorted(list(selected_numbers))
 
 
 # --- Output Generation ---
@@ -406,26 +551,26 @@ def generate_output_rows(stats, num_rows=6, numbers_per_row=NUMBERS_PER_ROW):
         print(f"Error: Insufficient most common numbers ({len(most_common_all)}) to generate rows.") ; return []
     # Validation for others happens as rows are generated
 
-    # Row 1: Top N Most Common
-    row1 = most_common_all[:numbers_per_row]
-    if len(row1) == numbers_per_row: 
-        rows.append(sorted(row1))
+    # --- Row 1: Probabilistic Weighted Selection ---
+    row1 = generate_probabilistic_row(stats, numbers_per_row)
+    if len(row1) == numbers_per_row:
+        rows.append(sorted(row1)) # Already sorted by generate_probabilistic_row
         used_numbers_global.update(row1)
-        print("Generated Row 1 (Most Common)")
-    else: 
-        print(f"Warning: Could not generate Row 1 with exactly {numbers_per_row} numbers. Aborting.")
+        # print("Generated Row 1 (Probabilistic Weighted)") # Message printed inside function
+    else:
+        print(f"Warning: Could not generate Row 1 (Probabilistic) with exactly {numbers_per_row} numbers (got {len(row1)}). Aborting.")
         return [] # Cannot proceed without Row 1
 
 
-    # Row 2: Top N Most Overdue (Cold), filled with next common if needed
+    # --- Row 2: Top N Most Overdue (Cold), filled with next common if needed ---
     row2_base = get_numbers_by_overdue(stats.get('cold', []), numbers_per_row)
     row2 = list(row2_base) # Start with the overdue numbers found
     needed_more_r2 = numbers_per_row - len(row2)
-    
+
     if needed_more_r2 > 0:
         print(f"Row 2: Found only {len(row2)} unique overdue numbers. Filling {needed_more_r2} slots with next common.")
-        # Find next common numbers NOT used in Row 1 and NOT already in row2_base
-        fill_candidates_r2 = [num for num in most_common_all[numbers_per_row:] if num not in used_numbers_global and num not in row2]
+        # Find next common numbers NOT used globally yet and NOT already in row2_base
+        fill_candidates_r2 = [num for num in most_common_all if num not in used_numbers_global and num not in row2]
         fill_count_r2 = 0
         for num in fill_candidates_r2:
             if len(row2) < numbers_per_row:
@@ -436,41 +581,42 @@ def generate_output_rows(stats, num_rows=6, numbers_per_row=NUMBERS_PER_ROW):
         if fill_count_r2 < needed_more_r2:
              print(f"Warning: Row 2 could only be filled to {len(row2)} numbers after trying next common.")
 
-    if len(row2) == numbers_per_row: 
+    if len(row2) == numbers_per_row:
         rows.append(sorted(row2))
         used_numbers_global.update(row2) # Add row 2 numbers to global used set
         print("Generated Row 2 (Most Overdue / Filled)")
-    else: 
+    else:
         print(f"Warning: Could not generate Row 2 (Most Overdue / Filled) with exactly {numbers_per_row} unique numbers (got {len(row2)}). Skipping row.")
         # Decide if we should abort or continue? For now, continue.
 
 
-    # Row 3: Next N Most Common (e.g., ranks 8-14 if numbers_per_row is 7)
-    start_index_r3 = numbers_per_row
-    end_index_r3 = numbers_per_row * 2
-    row3_candidates = [num for num in most_common_all[start_index_r3:end_index_r3] if num not in used_numbers_global] # Exclude globally used
-    row3 = row3_candidates[:numbers_per_row] # Take the first N available
-    
-    # If not enough unique candidates, fill with next available common
+    # --- Row 3: Next N Most Common ---
+    # Find candidates NOT used globally yet
+    row3_candidates = [num for num in most_common_all if num not in used_numbers_global]
+    row3 = row3_candidates[:numbers_per_row] # Take the first N available unique common numbers
+
+    # If not enough unique candidates, fill randomly (controversial, maybe skip?)
     needed_more_r3 = numbers_per_row - len(row3)
     if needed_more_r3 > 0:
-         print(f"Row 3: Found only {len(row3)} unique numbers in ranks {start_index_r3+1}-{end_index_r3}. Filling {needed_more_r3} slots with next common.")
-         fill_candidates_r3 = [num for num in most_common_all[end_index_r3:] if num not in used_numbers_global and num not in row3]
-         for num in fill_candidates_r3:
-              if len(row3) < numbers_per_row:
-                   row3.append(num)
-              else:
-                   break
+         print(f"Row 3: Found only {len(row3)} unique 'next common' numbers. Filling {needed_more_r3} slots randomly.")
+         all_possible_numbers = set(range(1, TOTAL_NUMBERS + 1))
+         available_fill_r3 = list(all_possible_numbers - used_numbers_global - set(row3))
+         try:
+             random_fill_r3 = random.sample(available_fill_r3, needed_more_r3)
+             row3.extend(random_fill_r3)
+         except ValueError:
+              print(f"Warning: Row 3 could only be filled to {len(row3)} numbers after trying random fill.")
 
-    if len(row3) == numbers_per_row: 
+
+    if len(row3) == numbers_per_row:
         rows.append(sorted(row3))
         used_numbers_global.update(row3) # Add row 3 numbers to global used set
         print("Generated Row 3 (Next Most Common / Filled)")
-    else: 
+    else:
         print(f"Warning: Could not generate Row 3 (Next Most Common) with exactly {numbers_per_row} unique numbers (got {len(row3)}). Skipping row.")
 
 
-    # Row 4: Mix Hot/Cold (e.g., 4 Hot + 3 Cold)
+    # --- Row 4: Mix Hot/Cold (e.g., 4 Hot + 3 Cold) ---
     count1_r4 = 4
     count2_r4 = 3
     # Use the full lists, let select_unique_combination handle uniqueness
@@ -478,32 +624,32 @@ def generate_output_rows(stats, num_rows=6, numbers_per_row=NUMBERS_PER_ROW):
     cold_candidates_r4 = most_overdue_all
     if len(hot_candidates_r4) >= count1_r4 and len(cold_candidates_r4) >= count2_r4:
         row4 = select_unique_combination(hot_candidates_r4, count1_r4, cold_candidates_r4, count2_r4, numbers_per_row)
-        if len(row4) == numbers_per_row: 
+        if len(row4) == numbers_per_row:
             rows.append(sorted(row4))
             print("Generated Row 4 (Mix Hot/Cold)")
-        else: 
+        else:
             print(f"Warning: Could not generate Row 4 (Mix Hot/Cold) with exactly {numbers_per_row} unique numbers (got {len(row4)}). Skipping row.")
     else:
         print(f"Warning: Insufficient base numbers for Row 4 (Mix Hot/Cold). Need {count1_r4} hot ({len(hot_candidates_r4)} avail), {count2_r4} cold ({len(cold_candidates_r4)} avail). Skipping row.")
 
-    # Row 5: Mix Next Hot/Cold (e.g., Hot ranks 5-8 + Cold ranks 4-6)
+    # --- Row 5: Mix Next Hot/Cold (e.g., Hot ranks 5-8 + Cold ranks 4-6) ---
     start_hot_r5 = count1_r4 # Start after the ones potentially used in Row 4
     count_hot_r5 = 4
     start_cold_r5 = count2_r4 # Start after the ones potentially used in Row 4
     count_cold_r5 = 3
-    hot_r5_candidates = most_common_all[start_hot_r5:] 
+    hot_r5_candidates = most_common_all[start_hot_r5:]
     cold_r5_candidates = most_overdue_all[start_cold_r5:]
     if len(hot_r5_candidates) >= count_hot_r5 and len(cold_r5_candidates) >= count_cold_r5:
         row5 = select_unique_combination(hot_r5_candidates, count_hot_r5, cold_r5_candidates, count_cold_r5, numbers_per_row)
-        if len(row5) == numbers_per_row: 
+        if len(row5) == numbers_per_row:
             rows.append(sorted(row5))
             print("Generated Row 5 (Mix Next Hot/Cold)")
-        else: 
+        else:
             print(f"Warning: Could not generate Row 5 (Mix Next Hot/Cold) with exactly {numbers_per_row} unique numbers (got {len(row5)}). Skipping row.")
     else:
          print(f"Warning: Insufficient candidate numbers for Row 5 (Mix Next Hot/Cold). Need {count_hot_r5} more hot ({len(hot_r5_candidates)} avail), {count_cold_r5} more cold ({len(cold_r5_candidates)} avail). Skipping row.")
 
-    # Row 6: Mix Least Common/Hot (e.g., 4 Least Common + 3 Hot)
+    # --- Row 6: Mix Least Common/Hot (e.g., 4 Least Common + 3 Hot) ---
     count1_r6 = 4
     count2_r6 = 3
     least_common_candidates_r6 = least_common_all
@@ -514,10 +660,10 @@ def generate_output_rows(stats, num_rows=6, numbers_per_row=NUMBERS_PER_ROW):
          print(f"Warning: Insufficient most common numbers ({len(hot_candidates_r6)}) for Row 6. Need {count2_r6}. Skipping row.")
     else:
         row6 = select_unique_combination(least_common_candidates_r6, count1_r6, hot_candidates_r6, count2_r6, numbers_per_row)
-        if len(row6) == numbers_per_row: 
+        if len(row6) == numbers_per_row:
             rows.append(sorted(row6))
             print("Generated Row 6 (Mix Least Common/Hot)")
-        else: 
+        else:
             print(f"Warning: Could not generate Row 6 (Mix Least Common/Hot) with exactly {numbers_per_row} unique numbers (got {len(row6)}). Skipping row.")
 
     # Return only the successfully generated rows
@@ -536,20 +682,27 @@ if __name__ == "__main__":
 
     if not latest_html_file or not os.path.exists(latest_html_file):
         print("Error: Could not find or download HTML statistics file. Trying fallback...")
-        attached_file = 'c:\\Users\\Owner\\Documents\\2025\\Lottery\\Oz Lotto Statistics, Number Frequencies & Most Drawn.html'
-        if os.path.exists(attached_file):
-             print(f"Attempting to use attached file: {attached_file}")
-             latest_html_file = attached_file
+        # Use a relative path for the fallback, assuming it's in the same directory structure
+        fallback_file = 'Oz Lotto Statistics, Number Frequencies & Most Drawn.html'
+        if os.path.exists(fallback_file):
+             print(f"Attempting to use fallback file: {fallback_file}")
+             latest_html_file = fallback_file
         else:
-             print("Error: Fallback file not found. Exiting.")
-             exit()
+             # Try the absolute path provided before as a last resort
+             abs_fallback_path = 'c:\\Users\\Owner\\Documents\\2025\\Lottery\\Oz Lotto Statistics, Number Frequencies & Most Drawn.html'
+             if os.path.exists(abs_fallback_path):
+                  print(f"Attempting to use absolute fallback file: {abs_fallback_path}")
+                  latest_html_file = abs_fallback_path
+             else:
+                  print("Error: Fallback file not found. Exiting.")
+                  exit()
 
     # 2. Read and parse the HTML
     try:
         with open(latest_html_file, 'r', encoding='utf-8') as f:
             html_content = f.read()
         soup = BeautifulSoup(html_content, 'html.parser')
-        print(f"Parsing data from: {latest_html_file}")
+        print(f"Parsing data from: {os.path.basename(latest_html_file)}") # Use basename for cleaner output
     except Exception as e:
         print(f"Error reading or parsing HTML file {latest_html_file}: {e}")
         exit()
@@ -559,36 +712,43 @@ if __name__ == "__main__":
 
     # Hot Numbers (used for reference, main frequency from numerical)
     hot_numbers_table = find_table_after_heading(soup, "Hot Numbers (Most Common)")
-    extracted_stats['hot'] = parse_table_data(hot_numbers_table, expected_cols=3) if hot_numbers_table else []
+    extracted_stats['hot'] = parse_table_data(hot_numbers_table, expected_cols=3)
 
     # Ordered by Ball Number (Primary source for frequency)
     extracted_stats['numerical'] = parse_numerical_order(soup)
 
     # Cold Numbers
     cold_numbers_table = find_table_after_heading(soup, "Cold Numbers (Most Overdue)")
-    extracted_stats['cold'] = parse_table_data(cold_numbers_table, expected_cols=2) if cold_numbers_table else []
+    extracted_stats['cold'] = parse_table_data(cold_numbers_table, expected_cols=2)
 
     # Least Often Picked
-    least_often_table = find_table_after_heading(soup, "Least Often Picked Numbers", heading_tag='div')
-    extracted_stats['least_often'] = parse_table_data(least_often_table, expected_cols=3) if least_often_table else []
+    # Try finding the heading as h2 first, then div if needed
+    least_often_heading = soup.find('h2', string=lambda t: t and "Least Often Picked Numbers" in t)
+    if least_often_heading:
+         least_often_table = find_table_after_heading(soup, "Least Often Picked Numbers", heading_tag='h2')
+    else:
+         least_often_table = find_table_after_heading(soup, "Least Often Picked Numbers", heading_tag='div') # Fallback to div search
+
+    extracted_stats['least_often'] = parse_table_data(least_often_table, expected_cols=3)
+
 
     # Pairs/Triplets (Optional: print or use in advanced strategies)
     common_pairs_table = find_table_in_div_after_heading(soup, "Most Common Pairs")
-    extracted_stats['pairs'] = parse_table_data(common_pairs_table, expected_cols=3) if common_pairs_table else []
+    extracted_stats['pairs'] = parse_table_data(common_pairs_table, expected_cols=3)
     consec_pairs_table = find_table_in_div_after_heading(soup, "Most Common Consecutive Pairs")
-    extracted_stats['consec_pairs'] = parse_table_data(consec_pairs_table, expected_cols=3) if consec_pairs_table else []
+    extracted_stats['consec_pairs'] = parse_table_data(consec_pairs_table, expected_cols=3)
     common_triplets_table = find_table_in_div_after_heading(soup, "Most Common Triplets")
-    extracted_stats['triplets'] = parse_table_data(common_triplets_table, expected_cols=4) if common_triplets_table else []
+    extracted_stats['triplets'] = parse_table_data(common_triplets_table, expected_cols=4)
     consec_triplets_table = find_table_in_div_after_heading(soup, "Most Common Consecutive Triplets")
-    extracted_stats['consec_triplets'] = parse_table_data(consec_triplets_table, expected_cols=4) if consec_triplets_table else []
+    extracted_stats['consec_triplets'] = parse_table_data(consec_triplets_table, expected_cols=4)
 
-    # Print extracted data (optional)
+    # Print extracted data summary (optional)
     print("\n--- Extracted Statistics Summary ---")
-    print(f"Hot Numbers found: {len(extracted_stats.get('hot', []))}")
     print(f"Numerical Order entries found: {len(extracted_stats.get('numerical', []))}")
     print(f"Cold Numbers found: {len(extracted_stats.get('cold', []))}")
     print(f"Least Often Picked found: {len(extracted_stats.get('least_often', []))}")
-    # Add prints for pairs/triplets if desired
+    # Add more prints if desired
+
 
     # 4. Generate Output Rows
     print(f"\n--- Generating {OUTPUT_FILENAME} ---")
@@ -602,9 +762,10 @@ if __name__ == "__main__":
                 with open(OUTPUT_FILENAME, 'w') as f:
                     f.write(f"# Oz Lotto Number Suggestions based on stats from {os.path.basename(latest_html_file)}\n")
                     f.write(f"# Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                    f.write("# Row 1: Most Common (Top 7 Freq)\n")
-                    f.write("# Row 2: Most Overdue (Top 7 Coldest)\n")
-                    f.write("# Row 3: Next Most Common (Freq Ranks 8-14)\n")
+                    # Update Row 1 description
+                    f.write("# Row 1: Probabilistic Weighted (Freq/Overdue Bias)\n")
+                    f.write("# Row 2: Most Overdue (Top 7 Coldest) / Filled\n")
+                    f.write("# Row 3: Next Most Common / Filled\n")
                     f.write("# Row 4: Mix Hot/Cold (Top 4 Freq / Top 3 Cold)\n")
                     f.write("# Row 5: Mix Next Hot/Cold (Next 4 Freq / Next 3 Cold)\n")
                     f.write("# Row 6: Mix Least Common/Hot (Top 4 Least Freq / Top 3 Freq)\n\n")
